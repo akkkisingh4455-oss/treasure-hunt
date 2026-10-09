@@ -1,6 +1,6 @@
 import os, json, sqlite3, secrets, random, math
 from functools import wraps
-from flask import Flask, request, redirect, session, g, abort, render_template_string as R
+from flask import Flask, request, redirect, session, g, abort, Response, render_template_string as R
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
@@ -8,22 +8,22 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hunt.db")
 NOW = "datetime('now','localtime')"
 
-# Kis step (checkpoint number) par puzzle ki jagah GAME aayega. Pehle step (start) par koi game nahi.
-# Options: memory, cipher, sliding, lights, sudoku, hanoi. Badalna ho to yahin badlein, jaise {2: "cipher", 4: "sliding"}
-# Games ab admin se tay hote hain: Admin -> "🎮 Games". Yahan sirf default (auto) hai, jab tak admin kuch save na kare.
+# At which step (checkpoint number) a GAME appears in place of the puzzle. No game at the first step (start).
+# Options: memory, cipher, sliding, lights, sudoku, hanoi. To change, edit here, e.g. {2: "cipher", 4: "sliding"}
+# Games are now set by the admin: Admin -> "🎮 Games". Only the default (auto) applies here until the admin saves something.
 GAME_KINDS = ["memory", "cipher", "sliding", "lights", "sudoku", "hanoi"]
 LEVELS = ["easy", "medium", "hard"]
 GAME_ORDER = ["memory", "cipher", "sliding", "lights"]
 AUTO_LEVEL = {"memory": "easy", "cipher": "medium", "sliding": "medium", "lights": "hard"}
 
 def game_steps(k):
-    """k = team ki normal locations ki ginti. Return {step: (game, level)}."""
+    """k = number of normal locations for the team. Return {step: (game, level)}."""
     r = q("select v from settings where k='games_cfg'", one=True)
-    if r:                                         # admin ne khud tay kiya hai
+    if r:                                         # set manually by the admin
         try: cfg = json.loads(r["v"])
         except Exception: cfg = {}
         return {int(p): (v[0], v[1] if v[1] in LEVELS else "medium") for p, v in cfg.items() if int(p) <= k and v[0] in GAME_KINDS}
-    pos, prev = [], 0                             # auto: 4 games aasaan se kathin, route par barabar felte hain
+    pos, prev = [], 0                             # auto: 4 games from easy to hard, spread evenly along the route
     for f in (0.3, 0.5, 0.7, 0.9):
         p = max(round(k * f), prev + 1, 1)
         if p > k: break
@@ -37,18 +37,19 @@ create table if not exists locations(id integer primary key, name text, slug tex
 create table if not exists riddles(location_id int, variant int, clue text default '', puzzle text default '', code text default '', primary key(location_id,variant));
 create table if not exists steps(team_id int, pos int, location_id int, scan_ts text, done_ts text, variant int default 0, primary key(team_id,pos));
 create table if not exists games(team_id int, pos int, kind text, state text, primary key(team_id,pos));
-create table if not exists settings(k text primary key, v text);"""
+create table if not exists settings(k text primary key, v text);
+create table if not exists rounds(id integer primary key, ts text, label text, data text);"""
 
 def per_team(conn, n):
-    """Har team kitni normal locations par jayegi (admin se badalta hai). 0/ghalat = sab."""
+    """How many normal locations each team visits (changed by the admin). 0/invalid = all."""
     r = conn.execute("select v from settings where k='per_team'").fetchone()
     try: k = int(r[0]) if r else 0
     except Exception: k = 0
     return n if k <= 0 else min(k, n)
 
 def gen_routes(conn, only=None):
-    """Har team ko alag order. 10 locations par 20 teams: har 10 teams ka alag 'kadam' (1,3,7,9),
-    taaki ek jagah par pahunchi do teams ka agla location alag ho. variant = team ka group (clue/puzzle/code ka set)."""
+    """Give each team a different order. With 10 locations and 20 teams: each group of 10 teams gets a different 'stride' (1,3,7,9),
+    so that two teams reaching the same place get different next locations. variant = the team's group (clue/puzzle/code set)."""
     teams = [r[0] for r in conn.execute("select id from teams order by id")]
     locs = [r[0] for r in conn.execute("select id from locations where kind='normal' order by id")]
     fin = [r[0] for r in conn.execute("select id from locations where kind='finish' order by id limit 1")]
@@ -73,16 +74,16 @@ with sqlite3.connect(DB) as c:
         for n in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo",
                   "Lima", "Mike", "November", "Oscar", "Papa", "Quebec", "Romeo", "Sierra", "Tango"]:
             c.execute("insert into teams(name,code) values(?,?)", ("Team " + n, secrets.token_hex(2).upper()))
-        for n, k1, k2 in [("Library", "Jahan kitabein hain par shor mana hai.", "Jahan book issue karwane ke liye card lagta hai."),
-                          ("Lab", "Jahan experiments hote hain aur coat pehna jaata hai.", "Jahan beaker aur oscilloscope rakhe milte hain."),
-                          ("Auditorium", "Jahan bade function aur seminar hote hain.", "Jahan stage aur sainkdon kursiyan lagi hain."),
-                          ("Ground", "Khula maidan jahan subah assembly hoti hai.", "Jahan jhanda fehraya jaata hai."),
-                          ("Sports Ground", "Jahan cricket, football aur kabaddi ke match hote hain.", "Jahan stumps aur goal post lage milte hain."),
-                          ("Civil Building", "Jahan naksho aur surveying ke instrument milte hain.", "Jahan bridges aur imaarton ke model dikhte hain."),
-                          ("Canteen", "Jahan chai aur samose milte hain.", "Jahan bhookh ka ilaaj milta hai."),
-                          ("Workshop", "Jahan lathe aur drilling machine chalti hain.", "Jahan welding ki chingariyan udti hain."),
-                          ("Garden", "Jahan phool khilte hain aur bench par log baithte hain.", "Jahan ghaas aur ped-paudhe lage hain."),
-                          ("Admin Block", "Jahan form jama hote hain aur office ka kaam hota hai.", "Jahan principal ka office hai.")]:
+        for n, k1, k2 in [("Library", "Where there are books but noise is not allowed.", "Where you need a card to get a book issued."),
+                          ("Lab", "Where experiments are done and a coat is worn.", "Where beakers and oscilloscopes are kept."),
+                          ("Auditorium", "Where big functions and seminars are held.", "Where there is a stage and hundreds of chairs."),
+                          ("Ground", "An open field where the morning assembly takes place.", "Where the flag is hoisted."),
+                          ("Sports Ground", "Where cricket, football and kabaddi matches are played.", "Where stumps and goal posts are set up."),
+                          ("Civil Building", "Where maps and surveying instruments are found.", "Where models of bridges and buildings are displayed."),
+                          ("Canteen", "Where tea and samosas are available.", "Where the cure for hunger is found."),
+                          ("Workshop", "Where lathe and drilling machines run.", "Where welding sparks fly."),
+                          ("Garden", "Where flowers bloom and people sit on benches.", "Where grass and plants are growing."),
+                          ("Admin Block", "Where forms are submitted and office work is done.", "Where the principal's office is.")]:
             lid = c.execute("insert into locations(name,slug,kind) values(?,?,'normal')", (n, n.lower().replace(" ", "-"))).lastrowid
             used = set()
             for v, k in enumerate([k1, k2]):
@@ -91,7 +92,7 @@ with sqlite3.connect(DB) as c:
                     if a * b not in used: break
                 used.add(a * b)
                 c.execute("insert into riddles values(?,?,?,?,?)", (lid, v, k,
-                          f"(Sample puzzle, apni se badlein) {a} x {b} kitna hota hai? Wahi aapka number code hai.", str(a * b)))
+                          f"(Sample puzzle, replace with your own) What is {a} x {b}? That is your number code.", str(a * b)))
         c.execute("insert into locations(name,slug,kind) values('Classroom','classroom','start')")
         gen_routes(c)
 
@@ -117,7 +118,7 @@ def req_code():
     return bool(r and r["v"] == "1")
 
 def content(loc_id, v):
-    """Is location ke liye team ke variant ka (clue, puzzle, code)."""
+    """The (clue, puzzle, code) for this location for the team's variant."""
     rows = q("select * from riddles where location_id=? order by variant", (loc_id,))
     return rows[(v or 0) % len(rows)] if rows else None
 
@@ -125,7 +126,7 @@ def game_for(step):
     return game_cfg(step)[0]
 
 def game_cfg(step):
-    """Is step par (game, level) ya (None, None). Finish par kabhi nahi."""
+    """(game, level) at this step, or (None, None). Never at the finish."""
     if step["kind"] == "finish": return None, None
     k = q("select count(*) from steps s join locations l on l.id=s.location_id where s.team_id=? and l.kind!='finish'", (step["team_id"],), one=True)[0]
     return game_steps(k).get(step["pos"], (None, None))
@@ -138,7 +139,7 @@ def show(step):
 STEPS = """select s.*, l.name lname, l.kind from steps s
            join locations l on l.id=s.location_id where s.team_id=? order by s.pos"""
 
-BASE = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
+BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
 <title>Treasure Hunt</title><style>
@@ -183,7 +184,7 @@ def leaderboard():
     refresh=15, rows=rows)
 
 
-# ---------- games (server par jaanche jaate hain, jawab browser mein nahi chhupta) ----------
+# ---------- games (checked on the server; the answer is not hidden in the browser) ----------
 PHRASES = {"easy": ["TEAM WORK", "STAY CURIOUS", "KEEP GOING"],
            "medium": ["TEAM WORK WINS", "KNOWLEDGE IS POWER", "ENGINEERS BUILD DREAMS", "NEVER STOP LEARNING", "THINK BEFORE YOU ACT"],
            "hard": ["ENGINEERS BUILD THE FUTURE TOGETHER", "SMALL STEPS LEAD TO BIG CHANGE", "FAILURE IS THE FIRST STEP TO SUCCESS"]}
@@ -198,7 +199,7 @@ def toggle(b, n, i):
 def gen_game(kind, level="medium"):
     if level not in LEVELS: level = "medium"
     st = {"level": level}
-    if kind == "sliding":                       # easy/medium 3x3 (kam/zyada ulti chaal), hard 4x4. Hamesha solvable.
+    if kind == "sliding":                       # easy/medium 3x3 (fewer/more scrambling moves), hard 4x4. Always solvable.
         n = 4 if level == "hard" else 3
         t, z, last = list(range(1, n * n)) + [0], n * n - 1, -1
         for _ in range({"easy": 20, "medium": 60, "hard": 120}[level]):
@@ -208,7 +209,7 @@ def gen_game(kind, level="medium"):
         st["tiles"] = t
     elif kind == "cipher":
         st.update(plain=random.choice(PHRASES[level]), shift=random.randint(*SHIFTS[level]))
-    elif kind == "sudoku":                      # 4x4, easy 6 / medium 9 / hard 12 khaali khane
+    elif kind == "sudoku":                      # 4x4, easy 6 / medium 9 / hard 12 empty cells
         base = [[1, 2, 3, 4], [3, 4, 1, 2], [2, 1, 4, 3], [4, 3, 2, 1]]
         d = random.sample([1, 2, 3, 4], 4)
         rows = random.sample([0, 1], 2) + random.sample([2, 3], 2)
@@ -216,10 +217,10 @@ def gen_game(kind, level="medium"):
         flat = [d[base[r][c] - 1] for r in rows for c in cols]
         hide = set(random.sample(range(16), {"easy": 6, "medium": 9, "hard": 12}[level]))
         st["puzzle"] = [0 if i in hide else v for i, v in enumerate(flat)]
-    elif kind == "memory":                      # easy 4 / medium 6 / hard 8 jodiyan
+    elif kind == "memory":                      # easy 4 / medium 6 / hard 8 pairs
         cards = EMOJI[:{"easy": 4, "medium": 6, "hard": 8}[level]] * 2
         random.shuffle(cards); st["cards"] = cards
-    elif kind == "lights":                      # easy 3x3, medium 4x4, hard 5x5; solved board par random dabaav (hamesha solvable)
+    elif kind == "lights":                      # easy 3x3, medium 4x4, hard 5x5; random presses on a solved board (always solvable)
         n = {"easy": 3, "medium": 4, "hard": 5}[level]
         while True:
             b = [0] * (n * n)
@@ -293,7 +294,7 @@ def game_auth():
 @app.post("/game/start")
 def game_start():
     a = game_auth()
-    if not a: return {"error": "Game abhi available nahi hai."}, 403
+    if not a: return {"error": "Game is not available right now."}, 403
     team, pend = a
     kind, level = game_cfg(pend)
     row = q("select state, kind from games where team_id=? and pos=?", (team["id"], pend["pos"]), one=True)
@@ -323,19 +324,19 @@ const post = (u, extra) => { if (G.pv) u = '/admin/pv' + u; const f = new FormDa
   for (const k in (extra || {})) f.append(k, extra[k]); return fetch(u, {method: 'POST', body: f}).then(r => r.json()); };
 const msg = t => { const m = box.querySelector('.gmsg'); if (m) m.textContent = t; };
 function done(payload){ post('/game/submit', {payload: JSON.stringify(payload)}).then(r => {
-  if (!r.ok) return msg('❌ Abhi sahi nahi hai, dobara koshish karein.');
-  box.innerHTML = '<div class="big">🎉 Jeet gaye!' + (r.code ? '\nAapka number code: <b style="font-size:34px">' + r.code + '</b>\nIse agli jagah ka QR scan karke wahan daalein.' : '\nAb agli jagah jaayein.') + '</div>'; }); }
+  if (!r.ok) return msg('❌ Not correct yet, please try again.');
+  box.innerHTML = '<div class="big">🎉 You won!' + (r.code ? '\nYour number code: <b style="font-size:34px">' + r.code + '</b>\nScan the QR of the next place and enter it there.' : '\nNow go to the next place.') + '</div>'; }); }
 const GAMES = {
  sliding(el, t){ const moves = [], n = Math.round(Math.sqrt(t.length)), goal = t.map((_, i) => (i + 1) % t.length).join(), sz = n > 3 ? 68 : 80;
    const draw = () => { el.innerHTML = '<div style="display:grid;grid-template-columns:repeat(' + n + ',' + sz + 'px);gap:6px;justify-content:center">' +
      t.map((v, i) => '<button data-i="' + i + '" style="height:' + sz + 'px;font-size:26px;' + (v ? '' : 'visibility:hidden') + '">' + v + '</button>').join('') +
-     '</div><p>Tiles ko 1 se ' + (t.length - 1) + ' ke order mein lagayein (khaali jagah neeche-right). Chaal: ' + moves.length + '</p>';
+     '</div><p>Arrange the tiles in order from 1 to ' + (t.length - 1) + ' (empty space at the bottom-right). Moves: ' + moves.length + '</p>';
     el.querySelectorAll('button').forEach(b => b.onclick = () => { const i = +b.dataset.i, z = t.indexOf(0);
      if (Math.abs((i / n | 0) - (z / n | 0)) + Math.abs(i % n - z % n) !== 1) return;
      t[z] = t[i]; t[i] = 0; moves.push(i); draw(); if (t.join() === goal) done({moves: moves}); }); };
    draw(); },
  memory(el, cards){ const moves = [], matched = new Set(); let open = [], lock = false;
-  const draw = () => { el.innerHTML = '<p>Jodiyan milayein: ek ke baad ek do card kholein. Ek jaise hon to khule rahenge. Chaal: ' + (moves.length / 2) + '</p><div style="display:grid;grid-template-columns:repeat(4,64px);gap:8px;justify-content:center">' +
+  const draw = () => { el.innerHTML = '<p>Match the pairs: open two cards one after the other. If they match, they stay open. Moves: ' + (moves.length / 2) + '</p><div style="display:grid;grid-template-columns:repeat(4,64px);gap:8px;justify-content:center">' +
     cards.map((v, i) => '<button data-i="' + i + '" style="height:64px;font-size:30px;' + (matched.has(i) ? 'background:#a9dfbf;' : '') + '">' + ((matched.has(i) || open.includes(i)) ? v : '❓') + '</button>').join('') + '</div>';
    el.querySelectorAll('button').forEach(b => b.onclick = () => { if (lock) return; const i = +b.dataset.i; if (matched.has(i) || open.includes(i)) return;
     open.push(i);
@@ -345,21 +346,21 @@ const GAMES = {
     else { draw(); lock = true; setTimeout(() => { open = []; lock = false; draw(); }, 800); } }); };
   draw(); },
  lights(el, L){ const presses = [], n = Math.round(Math.sqrt(L.length)), sz = Math.min(72, (280 / n) | 0);
-   const draw = () => { el.innerHTML = '<p>Saari batti band (andhera) karni hai. Ek batti dabane se wo aur uske upar-neeche-aaju-baaju wali badal jaati hain. Chaal: ' + presses.length + '</p><div style="display:grid;grid-template-columns:repeat(' + n + ',' + sz + 'px);gap:6px;justify-content:center">' +
+   const draw = () => { el.innerHTML = '<p>Turn all the lights off (dark). Pressing a light toggles it and the ones above, below, left and right of it. Moves: ' + presses.length + '</p><div style="display:grid;grid-template-columns:repeat(' + n + ',' + sz + 'px);gap:6px;justify-content:center">' +
      L.map((v, i) => '<button data-i="' + i + '" style="height:' + sz + 'px;background:' + (v ? '#ffd166' : '#2b2d42') + '"></button>').join('') + '</div>';
     el.querySelectorAll('button').forEach(b => b.onclick = () => { const i = +b.dataset.i, r = i / n | 0, c = i % n;
      [[r, c], [r + 1, c], [r - 1, c], [r, c + 1], [r, c - 1]].forEach(p => { if (p[0] >= 0 && p[0] < n && p[1] >= 0 && p[1] < n) L[p[0] * n + p[1]] ^= 1; });
      presses.push(i); draw(); if (L.every(x => !x)) done({presses: presses}); }); };
    draw(); },
- cipher(el, s){ el.innerHTML = '<div class="big">' + s.cipher + '</div><p>Har akshar alphabet mein ' + s.shift + ' kadam aage khisaka hua hai (jaise A ki jagah ' +
-   String.fromCharCode(65 + s.shift) + '). Original vaakya likhein:</p><input id="ca" style="width:100%;text-transform:uppercase"><button id="cb">Check</button>';
+ cipher(el, s){ el.innerHTML = '<div class="big">' + s.cipher + '</div><p>Each letter is shifted forward in the alphabet by ' + s.shift + ' positions (for example, instead of A it is ' +
+   String.fromCharCode(65 + s.shift) + '). Write the original sentence:</p><input id="ca" style="width:100%;text-transform:uppercase"><button id="cb">Check</button>';
   document.getElementById('cb').onclick = () => done({answer: document.getElementById('ca').value}); },
- sudoku(el, p){ el.innerHTML = '<p>Har row, column aur 2x2 box mein 1 se 4 ek-ek baar aane chahiye.</p><div style="display:grid;grid-template-columns:repeat(4,56px);gap:4px;justify-content:center">' +
+ sudoku(el, p){ el.innerHTML = '<p>Each row, column and 2x2 box must contain 1 to 4 exactly once.</p><div style="display:grid;grid-template-columns:repeat(4,56px);gap:4px;justify-content:center">' +
    p.map((v, i) => '<input ' + (v ? 'value="' + v + '" disabled' : '') + ' maxlength="1" inputmode="numeric" style="width:56px;height:56px;text-align:center;font-size:24px;' +
    (i % 4 === 1 ? 'margin-right:8px;' : '') + ((i / 4 | 0) === 1 ? 'margin-bottom:8px;' : '') + '">').join('') + '</div><button id="sb">Check</button>';
   document.getElementById('sb').onclick = () => done({grid: [...el.querySelectorAll('input')].map(x => +x.value || 0)}); },
  hanoi(el, s){ const N = s.n, pegs = [Array.from({length: N}, (_, i) => N - i), [], []], moves = []; let sel = -1;
-  const draw = () => { el.innerHTML = '<p>Saari disks ko teesre peg par le jaayein. Bari disk chhoti ke upar nahi rakh sakte. Pehle peg chunein, phir jahan rakhni hai wo. Chaal: ' + moves.length + '</p>' +
+  const draw = () => { el.innerHTML = '<p>Move all the disks to the third peg. A larger disk cannot be placed on a smaller one. First pick a peg, then the one where you want to place it. Moves: ' + moves.length + '</p>' +
    '<div style="display:flex;gap:10px;justify-content:center">' + pegs.map((p, i) => '<button data-i="' + i + '" style="width:30%;min-height:150px;display:flex;flex-direction:column-reverse;align-items:center;gap:3px;padding:6px;' +
    (sel === i ? 'outline:3px solid #e0a800;' : '') + '">' + p.map(d => '<span style="display:block;height:20px;width:' + (20 + d * (70 / N | 0)) + 'px;background:#ffd166;border-radius:4px;color:#222">' + d + '</span>').join('') + '</button>').join('') + '</div>';
    el.querySelectorAll('button').forEach(b => b.onclick = () => { const i = +b.dataset.i;
@@ -408,23 +409,23 @@ def games_page():
                 k, lv = request.form.get(f"k{p}", ""), request.form.get(f"l{p}", "medium")
                 if k in GAME_KINDS and lv in LEVELS: cfg[str(p)] = [k, lv]
             w("insert or replace into settings values('games_cfg',?)", (json.dumps(cfg),))
-        w("delete from games")                    # purane game-state hata do, naye settings ke hisaab se bante hain
+        w("delete from games")                    # remove old game states; new ones are created per the new settings
         return redirect("/admin/games")
     manual = q("select v from settings where k='games_cfg'", one=True) is not None
     cur = game_steps(kmax)
     return page("""<h2>🎮 Games</h2>
-    <div class="card"><h3>Kis step par kaun sa game</h3>
-    <p>Har team ke route ke step (1 se {{ kmax }}) par aap game chun sakte hain aur uski kathinai (easy / medium / hard). Jis step par "— koi nahi —" hai wahan sadi puzzle aur code chalega.
-    Abhi: <b>{{ 'aapki setting' if manual else 'auto (apne aap)' }}</b>.</p>
-    <form method="post"><table><tr><th>Step</th><th>Game</th><th>Kathinai</th></tr>
+    <div class="card"><h3>Which game at which step</h3>
+    <p>At each step of a team's route (1 to {{ kmax }}) you can choose a game and its difficulty (easy / medium / hard). At a step marked "— none —" the plain puzzle and code are used.
+    Currently: <b>{{ 'your setting' if manual else 'auto (automatic)' }}</b>.</p>
+    <form method="post"><table><tr><th>Step</th><th>Game</th><th>Difficulty</th></tr>
     {% for p in range(1, kmax + 1) %}{% set c = cur.get(p) %}<tr><td>{{ p }}</td>
-    <td><select name="k{{ p }}"><option value="">— koi nahi —</option>{% for k in kinds %}<option value="{{ k }}" {{ 'selected' if c and c[0] == k }}>{{ k }}</option>{% endfor %}</select></td>
+    <td><select name="k{{ p }}"><option value="">— none —</option>{% for k in kinds %}<option value="{{ k }}" {{ 'selected' if c and c[0] == k }}>{{ k }}</option>{% endfor %}</select></td>
     <td><select name="l{{ p }}">{% for l in levels %}<option value="{{ l }}" {{ 'selected' if (c[1] if c else 'medium') == l }}>{{ l }}</option>{% endfor %}</select></td></tr>{% endfor %}</table>
-    <button>Save</button> <button name="auto" value="1" formnovalidate onclick="return confirm('Auto par wapas?')">Auto par wapas</button></form></div>
-    <div class="card"><h3>Game test karein</h3><p>Koi bhi game turant khel kar dekhein. Jeetne par code "1234 (preview)" dikhega.</p>
+    <button>Save</button> <button name="auto" value="1" formnovalidate onclick="return confirm('Back to auto?')">Back to auto</button></form></div>
+    <div class="card"><h3>Test a game</h3><p>Play any game right away. When you win, the code "1234 (preview)" will be shown.</p>
     <form method="get" onsubmit="location.href='/admin/games/'+this.k.value+'?level='+this.l.value; return false">
     <select name="k">{% for k in kinds %}<option>{{ k }}</option>{% endfor %}</select>
-    <select name="l">{% for l in levels %}<option {{ 'selected' if l == 'medium' }}>{{ l }}</option>{% endfor %}</select> <button>Khelein</button></form></div>""",
+    <select name="l">{% for l in levels %}<option {{ 'selected' if l == 'medium' }}>{{ l }}</option>{% endfor %}</select> <button>Play</button></form></div>""",
     kinds=GAME_KINDS, levels=LEVELS, kmax=kmax, cur=cur, manual=manual)
 
 @app.route("/admin/games/<kind>")
@@ -432,9 +433,128 @@ def games_page():
 def game_preview(kind):
     if kind not in GAME_KINDS: abort(404)
     level = request.args.get("level", "medium")
-    return page("""<h2>🎮 {{ kind }} ({{ level }}) — preview</h2><div id="game" class="card">Game load ho raha hai...</div>
+    return page("""<h2>🎮 {{ kind }} ({{ level }}) — preview</h2><div id="game" class="card">Loading game...</div>
     <script>window.GAME={team:0,tcode:"",pos:0,pv:{{ kind|tojson }},level:{{ level|tojson }}};</script><script>{{ gjs|safe }}</script>
     <p><a href="/admin/games">← Games</a></p>""", kind=kind, level=level, gjs=GAME_JS)
+
+# ---------- admin: round history (result save) + backup/restore ----------
+def snapshot(label=""):
+    """Saves the complete current result (each team's route + what happened when) in the 'rounds' table."""
+    out = []
+    for t in q("select * from teams order by name"):
+        st = q("select s.pos, l.name lname, s.scan_ts, s.done_ts from steps s join locations l on l.id=s.location_id where s.team_id=? order by s.pos", (t["id"],))
+        done = [x for x in st if x["done_ts"]]
+        out.append({"team": t["name"], "code": t["code"], "done": len(done), "total": len(st),
+                    "finished": bool(st) and len(done) == len(st), "last": max((x["done_ts"] for x in done), default=""),
+                    "steps": [[x["pos"], x["lname"], x["scan_ts"] or "", x["done_ts"] or ""] for x in st]})
+    if not any(t["done"] or any(x[2] for x in t["steps"]) for t in out): return None      # nothing played, so nothing to save
+    cur = w(f"insert into rounds(ts,label,data) values({NOW},?,?)", (label or "Round", json.dumps(out, ensure_ascii=False)))
+    return cur
+
+def rank(data):
+    return sorted(data, key=lambda t: (not t["finished"], -t["done"], t["last"] or "9"))
+
+@app.route("/admin/history")
+@admin
+def history_page():
+    rows = q("select id, ts, label, data from rounds order by id desc")
+    rows = [{"id": r["id"], "ts": r["ts"], "label": r["label"], "n": len(json.loads(r["data"])),
+             "win": (rank(json.loads(r["data"])) or [{}])[0].get("team", "-")} for r in rows]
+    return page("""<h2>📜 Past rounds</h2><div class="card">
+    <form method="post" action="/admin/history/save">Save the current result (without resetting): <input name="label" placeholder="Name, e.g. Round 1" style="width:180px"> <button>💾 Save</button></form></div>
+    <div class="card">{% if not rows %}<p>No round has been saved yet. When you press "New round", the old result is saved here automatically.</p>{% else %}
+    <table><tr><th>Round</th><th>When</th><th>Teams</th><th>First</th><th></th></tr>
+    {% for r in rows %}<tr><td>{{ r.label }}</td><td>{{ r.ts }}</td><td>{{ r.n }}</td><td>{{ r.win }}</td>
+    <td><a href="/admin/history/{{ r.id }}">View</a> | <a href="/admin/history/{{ r.id }}.csv">CSV</a></td></tr>{% endfor %}</table>{% endif %}</div>
+    <div class="card"><h3>Backup / Restore (clue, puzzle, teams, locations)</h3>
+    <p><a href="/admin/backup.json"><button type="button">⬇️ Backup download</button></a></p>
+    <form method="post" action="/admin/restore" enctype="multipart/form-data" onsubmit="return confirm('The existing locations, puzzles and teams will be removed and replaced by those in the backup. Are you sure?')">
+    <input type="file" name="f" accept=".json" required> <button class="del">⬆️ Restore</button></form></div>""", rows=rows)
+
+@app.post("/admin/history/save")
+@admin
+def history_save():
+    snapshot(request.form.get("label", "").strip())
+    return redirect("/admin/history")
+
+def _round(rid):
+    r = q("select * from rounds where id=?", (rid,), one=True)
+    if not r: abort(404)
+    return r, rank(json.loads(r["data"]))
+
+@app.route("/admin/history/<int:rid>")
+@admin
+def history_view(rid):
+    r, data = _round(rid)
+    return page("""<h2>📜 {{ r.label }} <small>({{ r.ts }})</small></h2><div class="card"><table>
+    <tr><th>#</th><th>Team</th><th>Progress</th><th>Last time</th><th>Route (✅ = complete)</th></tr>
+    {% for t in data %}<tr><td>{{ loop.index }}</td><td>{{ t.team }} {% if t.finished %}🏁{% endif %}</td><td>{{ t.done }}/{{ t.total }}</td><td>{{ t.last or '-' }}</td>
+    <td>{% for s in t.steps %}{{ '✅' if s[3] else ('⏳' if s[2] else '·') }}{{ s[1] }}{% if not loop.last %} → {% endif %}{% endfor %}</td></tr>{% endfor %}</table></div>
+    <p><a href="/admin/history">← all rounds</a> | <a href="/admin/history/{{ r.id }}.csv">CSV download</a></p>""", r=r, data=data)
+
+@app.route("/admin/history/<int:rid>.csv")
+@admin
+def history_csv(rid):
+    import csv, io
+    r, data = _round(rid)
+    buf = io.StringIO(); cw = csv.writer(buf)
+    cw.writerow(["Rank", "Team", "Code", "Completed", "Total", "Finish", "Last time", "Route"])
+    for i, t in enumerate(data, 1):
+        cw.writerow([i, t["team"], t["code"], t["done"], t["total"], "yes" if t["finished"] else "no", t["last"],
+                     " -> ".join(f"{s[1]} ({s[3] or 'pending'})" for s in t["steps"])])
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=round_{rid}.csv"})
+
+@app.route("/admin/backup.json")
+@admin
+def backup():
+    d = {"teams": [dict(r) for r in q("select * from teams")], "locations": [dict(r) for r in q("select * from locations")],
+         "riddles": [dict(r) for r in q("select * from riddles")], "settings": [dict(r) for r in q("select * from settings")]}
+    return Response(json.dumps(d, ensure_ascii=False, indent=1), mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=hunt_backup.json"})
+
+@app.post("/admin/restore")
+@admin
+def restore():
+    try: d = json.load(request.files["f"].stream)
+    except Exception: return page("<div class='card'>❌ This does not look like a valid backup file.</div><p><a href='/admin/history'>← back</a></p>")
+    snapshot("Before restore")
+    for t in ("games", "steps", "teams", "riddles", "locations"): w(f"delete from {t}")
+    for r in d.get("teams", []): w("insert into teams(id,name,code) values(?,?,?)", (r["id"], r["name"], r["code"]))
+    for r in d.get("locations", []): w("insert into locations(id,name,slug,kind) values(?,?,?,?)", (r["id"], r["name"], r["slug"], r.get("kind", "normal")))
+    for r in d.get("riddles", []): w("insert into riddles(location_id,variant,clue,puzzle,code) values(?,?,?,?,?)", (r["location_id"], r["variant"], r.get("clue", ""), r.get("puzzle", ""), r.get("code", "")))
+    for r in d.get("settings", []): w("insert or replace into settings values(?,?)", (r["k"], r["v"]))
+    gen_routes(db())
+    return redirect("/admin")
+
+# ---------- admin: refresh / reset (to reuse the hunt) ----------
+@app.route("/admin/reset", methods=["GET", "POST"])
+@admin
+def reset_page():
+    if request.method == "POST":
+        act = request.form.get("act")
+        if act in ("round", "all"): snapshot(request.form.get("label", "").strip())     # save the result before resetting
+        if act == "round":                       # teams, locations, puzzles, settings remain; only progress + routes are new
+            w("delete from games")
+            gen_routes(db())
+        elif act == "all":                       # remove the teams too (locations, puzzles, settings remain)
+            w("delete from games"); w("delete from steps"); w("delete from teams")
+        return redirect("/admin/reset?done=" + (act or ""))
+    teams = q("select count(*) from teams", one=True)[0]
+    prog = q("select count(*) from steps where done_ts is not null", one=True)[0]
+    return page("""<h2>🔄 Refresh / Reset</h2>
+    {% if done %}<div class="card" style="background:#d4edda">✅ Done.</div>{% endif %}
+    <div class="card"><p>Currently: <b>{{ teams }}</b> teams, <b>{{ prog }}</b> checkpoints completed.</p>
+    <h3>1. New round (this is what you usually need)</h3>
+    <p>All teams' progress and the leaderboard are reset to zero, and each team gets a new random route.
+    Teams, locations, clues/puzzles/codes, the games setting and the number of routes stay as they are.</p>
+    <form method="post" onsubmit="return confirm('The progress of all teams will be erased. Are you sure?')">
+    <input type="hidden" name="act" value="round"><input name="label" placeholder="Name of this round (e.g. Round 1)" style="width:230px"> <button class="del">🔄 Start new round</button></form>
+    <p>Before the reset, the result of the old round is saved automatically: <a href="/admin/history">📜 Past rounds</a></p></div>
+    <div class="card"><h3>2. Also remove the teams</h3>
+    <p>Along with the round reset, all teams are also deleted so that you can create new teams. Locations and puzzles stay.</p>
+    <form method="post" onsubmit="return confirm('All teams will be deleted. Are you sure?')">
+    <input type="hidden" name="act" value="all"><input type="hidden" name="label" value="Before removing teams"><button class="del">🗑️ Remove teams + progress</button></form></div>""",
+    teams=teams, prog=prog, done=request.args.get("done"))
 
 # ---------- participant side ----------
 @app.route("/s/<slug>", methods=["GET", "POST"])
@@ -446,12 +566,12 @@ def scan(slug):
         team = q("select * from teams where id=?", (request.form.get("team_id"),), one=True)
         tcode = request.form.get("code", "").strip().upper()
         if not team or (req_code() and team["code"] != tcode):
-            msg, team = "❌ Team code galat hai.", None
+            msg, team = "❌ Wrong team code.", None
         else:
             steps = q(STEPS, (team["id"],))
             pend = next((s for s in steps if not s["done_ts"]), None)
             ans = request.form.get("answer")
-            if not steps: msg = "Aapka route set nahi hai, organizer se milein."
+            if not steps: msg = "Your route is not set; please contact the organizer."
             elif pend is None: res["finished"] = True
             elif loc["kind"] == "start": res.update(show(pend)); res["first"] = True
             elif pend["location_id"] == loc["id"]:
@@ -461,7 +581,7 @@ def scan(slug):
                 need = (cur["code"] if cur else "").strip().replace(" ", "").lower()
                 if need and ans is None: res["gate"] = True
                 elif need and ans.strip().replace(" ", "").lower() != need:
-                    msg, res["gate"] = "❌ Code galat hai, paheli dobara dekhein aur phir try karein.", True
+                    msg, res["gate"] = "❌ Wrong code, look at the puzzle again and try once more.", True
                 else:
                     w(f"update steps set done_ts={NOW} where team_id=? and pos=?", tp)
                     nxt = steps[pend["pos"]] if pend["pos"] < len(steps) else None
@@ -469,24 +589,24 @@ def scan(slug):
                     else: res["finished"] = True
             elif any(s["location_id"] == loc["id"] and s["done_ts"] for s in steps):
                 res.update(show(pend)); res["again"] = True
-            else: msg = "⚠️ Ye aapka agla checkpoint nahi hai. Apni pichli clue dobara padhein."
+            else: msg = "⚠️ This is not your next checkpoint. Read your previous clue again."
     return page("""<h2>📍 {{ loc.name }}</h2>
-    {% if res.get('finished') %}<div class="big">🎉 Badhai ho {{ team.name }}! Aapne saari paheliyan solve kar li, aap finish line par hain!</div>
-    {% elif res.get('gate') %}{% if msg %}<p class="err">{{ msg }}</p>{% else %}<p class="ok">✅ Sahi jagah par pahunche, {{ team.name }}!</p>{% endif %}
+    {% if res.get('finished') %}<div class="big">🎉 Congratulations {{ team.name }}! You have solved all the puzzles, you are at the finish line!</div>
+    {% elif res.get('gate') %}{% if msg %}<p class="err">{{ msg }}</p>{% else %}<p class="ok">✅ You've reached the right place, {{ team.name }}!</p>{% endif %}
       <form method="post" class="card"><input type="hidden" name="team_id" value="{{ team.id }}">
       <input type="hidden" name="code" value="{{ tcode }}">
-      <label><b>Pichli paheli solve karke jo number code mila wo yahan daalein:</b></label><br>
+      <label><b>Enter the number code you got by solving the previous puzzle here:</b></label><br>
       <input name="answer" required autocomplete="off" inputmode="numeric" placeholder="Number code" style="width:100%;font-size:20px">
       <button style="width:100%">Unlock</button></form>
-    {% elif 'clue' in res %}<p class="ok">{{ '🔁 Aapki current clue aur paheli:' if (res.get('again') or res.get('first')) else '✅ Code sahi! Ye rahi aapki agli clue aur paheli:' }}</p>
+    {% elif 'clue' in res %}<p class="ok">{{ '🔁 Your current clue and puzzle:' if (res.get('again') or res.get('first')) else '✅ Code correct! Here are your next clue and puzzle:' }}</p>
       {% if res.clue %}<div class="big">📍 {{ res.clue }}</div>{% endif %}
-      {% if res.get('game') %}<div class="big">🎮 Is baar ek game khelna hai! Jeetne par aapko number code milega.</div>
-      <div id="game" class="card">Game load ho raha hai...</div>
+      {% if res.get('game') %}<div class="big">🎮 This time you have to play a game! If you win, you will get a number code.</div>
+      <div id="game" class="card">Loading game...</div>
       <script>window.GAME={team:{{ team.id }},tcode:{{ tcode|tojson }},pos:{{ res.pos }}};</script><script>{{ gjs|safe }}</script>
       {% elif res.puzzle %}<div class="big">🧩 {{ res.puzzle }}</div>
-      <p>Paheli solve karke jo number code mile, use agli jagah ka QR scan karke wahan daalein.</p>{% endif %}
+      <p>Solve the puzzle, then scan the QR of the next place and enter the number code you get there.</p>{% endif %}
     {% else %}{% if msg %}<p class="err">{{ msg }}</p>{% endif %}
-    <form method="post"><p><b>Apni team ke naam par click karein</b></p>
+    <form method="post"><p><b>Click on your team's name</b></p>
     {% if rc %}<input name="code" placeholder="Team code" required autocomplete="off" style="text-transform:uppercase;width:100%"><br>{% endif %}
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:8px">
     {% for t in teams %}<button name="team_id" value="{{ t.id }}" style="padding:14px 6px;font-size:16px">{{ t.name }}</button>{% endfor %}
@@ -512,8 +632,8 @@ def dash():
     for s in q("select s.*, l.name lname from steps s join locations l on l.id=s.location_id order by team_id,pos"):
         routes.setdefault(s["team_id"], []).append(s)
     return page("""<h2>Dashboard</h2>
-    <div class="card"><h3>Progress (kaun kahan pahuncha)</h3>
-    <p>✅ code sahi, aage badh gayi &nbsp; ⏳ pahunch gayi, code baaki &nbsp; · abhi nahi pahunchi</p><div style="overflow-x:auto"><table>
+    <div class="card"><h3>Progress (who has reached where)</h3>
+    <p>✅ code correct, moved on &nbsp; ⏳ arrived, code pending &nbsp; · not reached yet</p><div style="overflow-x:auto"><table>
     <tr><th>Team</th><th>Code</th><th>Done</th><th>Route</th><th></th></tr>
     {% for t in teams %}{% set rt = routes.get(t.id, []) %}<tr>
     <td><form method="post" action="/admin/team/{{ t.id }}/rename"><input name="name" value="{{ t.name }}" size="12"><button>Save</button></form></td>
@@ -521,18 +641,18 @@ def dash():
     <td>{% for s in rt %}{{ '✅' if s.done_ts else ('⏳' if s.scan_ts else '·') }}{{ s.lname }}{% if not loop.last %} → {% endif %}{% endfor %}</td>
     <td><a href="/admin/team/{{ t.id }}/route">Route</a>
     <form method="post" action="/admin/team/{{ t.id }}/delete" onsubmit="return confirm('Delete {{ t.name }}?')"><button class="del">Delete</button></form></td></tr>{% endfor %}</table></div></div>
-    <div class="card"><h3>Team add karein</h3><form method="post" action="/admin/team">
+    <div class="card"><h3>Add a team</h3><form method="post" action="/admin/team">
     <input name="name" placeholder="Team name" required><button>Add</button></form>
     <h3>Team code: {{ 'ON' if rc else 'OFF' }}</h3><form method="post" action="/admin/toggle_code">
-    <button>{{ 'OFF karein' if rc else 'ON karein (naam + code)' }}</button></form></div>
+    <button>{{ 'Turn OFF' if rc else 'Turn ON (name + code)' }}</button></form></div>
     <div class="card"><h3>Locations (clue / puzzle / code + QR)</h3><table>
     {% for l in locs %}<tr><td>{{ l.name }} <small>({{ l.kind }})</small></td><td><a href="/admin/loc/{{ l.id }}">Edit + QR</a></td>
     <td><form method="post" action="/admin/loc/{{ l.id }}/delete" onsubmit="return confirm('Delete?')"><button class="del">Delete</button></form></td></tr>{% endfor %}</table>
     <form method="post" action="/admin/loc"><input name="name" placeholder="Location name" required>
     <select name="kind"><option value="normal">Normal</option><option value="finish">Finish</option><option value="start">Start</option></select>
     <button>Add location</button></form>
-    <p><small>Naya location jodne ke baad Routes page se "Routes dobara banayein" dabayein.</small></p></div>
-    <div class="card"><a href="/admin/routes">🗺️ Routes</a> &nbsp;|&nbsp; <a href="/admin/games">🎮 Games</a> &nbsp;|&nbsp; <a href="/admin/logout">Logout</a></div>""",
+    <p><small>After adding a new location, press "Regenerate routes" on the Routes page.</small></p></div>
+    <div class="card"><a href="/admin/routes">🗺️ Routes</a> &nbsp;|&nbsp; <a href="/admin/games">🎮 Games</a> &nbsp;|&nbsp; <a href="/admin/reset">🔄 Refresh</a> &nbsp;|&nbsp; <a href="/admin/history">📜 History</a> &nbsp;|&nbsp; <a href="/admin/logout">Logout</a></div>""",
     teams=teams, locs=locs, routes=routes, rc=req_code())
 
 @app.post("/admin/toggle_code")
@@ -597,16 +717,16 @@ def loc_page(i):
     return page("""<h2>{{ loc.name }} <small>({{ loc.kind }})</small></h2><div class="card" style="text-align:center">
     <div id="qr" style="display:inline-block"></div><p><code>{{ url }}</code></p>
     <button class="noprint" onclick="print()">Print QR</button></div>
-    <form method="post" class="noprint"><div class="card"><label>Naam</label><br><input name="name" value="{{ loc.name }}"></div>
-    {% if loc.kind != 'start' %}<div class="card"><p><b>Is jagah ke liye clue + puzzle + code.</b> Team ko clue aur puzzle pichli jagah (ya start) par dikhte hain.
-    Puzzle solve karke jo <b>number code</b> mile, use team is jagah ka QR scan karke daalegi. Kuch steps par puzzle ki jagah game aata hai (Admin → Games se tay karein); clue aur code tab bhi yahin ke chalte hain. Alag-alag team group ko alag set milta hai,
-    isliye ek hi jagah jaane wali do teams ko alag puzzle/code milega (kam se kam 2 set rakhein).</p></div>
+    <form method="post" class="noprint"><div class="card"><label>Name</label><br><input name="name" value="{{ loc.name }}"></div>
+    {% if loc.kind != 'start' %}<div class="card"><p><b>Clue + puzzle + code for this place.</b> The team sees the clue and puzzle at the previous place (or start).
+    The team solves the puzzle and enters the resulting <b>number code</b> after scanning this place's QR. At some steps a game appears instead of the puzzle (set it from Admin → Games); the clue and code from here still apply then. Different team groups get different sets,
+    so two teams going to the same place get different puzzles/codes (keep at least 2 sets).</p></div>
     {% for v in vs %}<div class="card"><h3>Set {{ v.variant + 1 }}</h3>
-    <label>Clue (is jagah ka rasta)</label><br><textarea name="clue_{{ v.variant }}" rows="2" style="width:100%">{{ v.clue }}</textarea><br>
-    <label>Puzzle (jigsaw / word riddle ka description)</label><br><textarea name="puzzle_{{ v.variant }}" rows="3" style="width:100%">{{ v.puzzle }}</textarea><br>
-    <label>Number code (puzzle ka jawab)</label> <input name="code_{{ v.variant }}" value="{{ v.code }}" size="10">
-    <button class="del" name="act" value="del_{{ v.variant }}" onclick="return confirm('Is set ko delete karein?')">Delete set</button></div>{% endfor %}
-    <button name="act" value="add">+ Naya set</button> {% endif %}<button name="act" value="save">Save</button></form>
+    <label>Clue (the way to this place)</label><br><textarea name="clue_{{ v.variant }}" rows="2" style="width:100%">{{ v.clue }}</textarea><br>
+    <label>Puzzle (description of the jigsaw / word riddle)</label><br><textarea name="puzzle_{{ v.variant }}" rows="3" style="width:100%">{{ v.puzzle }}</textarea><br>
+    <label>Number code (answer to the puzzle)</label> <input name="code_{{ v.variant }}" value="{{ v.code }}" size="10">
+    <button class="del" name="act" value="del_{{ v.variant }}" onclick="return confirm('Delete this set?')">Delete set</button></div>{% endfor %}
+    <button name="act" value="add">+ New set</button> {% endif %}<button name="act" value="save">Save</button></form>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script>new QRCode(document.getElementById('qr'),{text:{{ url|tojson }},width:260,height:260});</script>""", loc=loc, vs=vs, url=url)
 
@@ -623,10 +743,10 @@ def routes_page():
     rows = {}
     for s in q("select s.team_id, s.pos, l.name lname from steps s join locations l on l.id=s.location_id order by team_id,pos"):
         rows.setdefault(s["team_id"], []).append(s["lname"])
-    return page("""<h2>🗺️ Routes</h2><div class="card"><p>Har team ko alag order milta hai taaki sab ek hi jagah par na jamen.</p>
-    <form method="post" onsubmit="return confirm('Sabhi routes dobara bante hain aur progress reset ho jayegi. Pakka?')">
-    Har team kitni locations par jayegi (kul {{ nloc }} mein se): <input name="per_team" type="number" min="1" max="{{ nloc }}" value="{{ cur_k }}" style="width:70px">
-    <button class="del">Save aur routes dobara banayein (progress reset)</button></form></div>
+    return page("""<h2>🗺️ Routes</h2><div class="card"><p>Each team gets a different order so that everyone doesn't crowd at the same place.</p>
+    <form method="post" onsubmit="return confirm('All routes will be regenerated and progress will be reset. Are you sure?')">
+    How many locations each team will visit (out of {{ nloc }} in total): <input name="per_team" type="number" min="1" max="{{ nloc }}" value="{{ cur_k }}" style="width:70px">
+    <button class="del">Save and regenerate routes (progress reset)</button></form></div>
     <div class="card"><table>{% for t in teams %}<tr><td><a href="/admin/team/{{ t.id }}/route">{{ t.name }}</a></td>
     <td>{{ rows.get(t.id, [])|join(' → ') }}</td></tr>{% endfor %}</table></div>""", teams=q("select * from teams order by name"), rows=rows, nloc=nloc, cur_k=cur_k)
 
@@ -644,7 +764,7 @@ def team_route(i):
             if request.form.get(f"p{p}"): db().execute("insert into steps(team_id,pos,location_id,variant) values(?,?,?,?)", (i, p, request.form[f"p{p}"], v))
         db().commit(); return redirect("/admin/routes")
     cur = {s["pos"]: s["location_id"] for s in q("select pos,location_id from steps where team_id=?", (i,))}
-    return page("""<h2>Route: {{ t.name }}</h2><form method="post" class="card"><p>Save karne par is team ki progress reset hogi.</p>
+    return page("""<h2>Route: {{ t.name }}</h2><form method="post" class="card"><p>Saving will reset this team's progress.</p>
     {% for p in range(1, n + 1) %}Step {{ p }}: <select name="p{{ p }}"><option value="">--</option>
     {% for l in locs %}<option value="{{ l.id }}" {{ 'selected' if cur.get(p) == l.id }}>{{ l.name }}</option>{% endfor %}</select><br>{% endfor %}
     <button>Save route</button></form>""", t=t, locs=locs, n=n, cur=cur)
