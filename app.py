@@ -5,8 +5,18 @@ from flask import Flask, request, redirect, session, g, abort, Response, render_
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+def _load_secret():
+    # Random session secret, created once and saved next to app.py (so nobody can forge an admin login with a known default).
+    if os.environ.get("SECRET_KEY"): return os.environ["SECRET_KEY"]
+    fp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret.key")
+    try:
+        with open(fp) as fh: return fh.read().strip()
+    except OSError:
+        k = secrets.token_hex(32)
+        with open(fp, "w") as fh: fh.write(k)
+        return k
+app.secret_key = _load_secret()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "Hunt-cmh4-fj5z")   # owner password. Change it from Admin -> Password, or set the ADMIN_PASS environment variable.
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hunt.db")
 NOW = "datetime('now','localtime')"
 
@@ -125,6 +135,9 @@ with sqlite3.connect(DB) as c:
         gen_routes(c)
 
 with sqlite3.connect(DB) as c: fix_variants(c)
+with sqlite3.connect(DB) as c:
+    print("\n[DB] Using database file:", DB)
+    print("[DB] Teams:", c.execute("select count(*) from teams").fetchone()[0], "| Locations:", c.execute("select count(*) from locations").fetchone()[0], "\n")
 
 def db():
     if "db" not in g:
